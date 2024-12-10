@@ -8,13 +8,22 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from typing import List, Dict, Any
 from collections import Counter
-from models import LanguageModelDataset
+from models import (
+    GAModel,
+    MarkovModel,
+    SelfAttentionModel,
+    LanguageModelDataset,
+)
 
 
 def measure_memory_usage():
-    """Get current memory usage in MB"""
+    """Get current memory usage in MB using multiple measurements"""
     process = psutil.Process()
-    return process.memory_info().rss / 1024 / 1024
+    measurements = []
+    for _ in range(5):  # Take several measurements
+        measurements.append(process.memory_info().rss / 1024 / 1024)
+        time.sleep(0.1)  # Short delay between measurements
+    return np.median(measurements)  # Return median value
 
 
 def calculate_perplexity(model: Any, test_data: List[str]) -> float:
@@ -78,48 +87,52 @@ def calculate_perplexity(model: Any, test_data: List[str]) -> float:
                     total_words += 1
 
     elif hasattr(model, "word_chain_probs"):  # Markov Model
+        # Pre-compute constants
+        vocab_size = len(model.vocabulary)
+        total_word_count = sum(model.word_counts.values())
+
+        # Cache lambda weights
+        lambda1, lambda2, lambda3 = 0.7, 0.2, 0.1
+
         for sentence in test_data:
             words = model.preprocess_text(sentence)
-            for i in range(len(words) - model.order):
-                context = tuple(words[i : i + model.order])
-                next_word = words[i + model.order]
+            if len(words) < model.order + 1:
+                continue
 
-                # Use interpolation between n-gram orders
-                probs = []
-                total_lambda = 0
+            padded_words = [model.start_token] * model.order + words
 
-                # Full context probability
-                if context in model.word_chain:
-                    count = model.word_chain[context].get(next_word, 0)
-                    total = sum(model.word_chain[context].values())
-                    probs.append((0.7, (count + 1) / (total + len(model.vocabulary))))
-                    total_lambda += 0.7
+            for i in range(len(words)):
+                context = tuple(padded_words[i : i + model.order])
+                next_word = words[i]
 
-                # Lower order context
-                if len(context) > 1:
+                prob = 0
+
+                # Full context probability (highest weight)
+                if context in model.word_chain_probs:
+                    context_probs = model.word_chain_probs[context]
+                    if next_word in context_probs:
+                        prob += lambda1 * context_probs[next_word]
+
+                # Backoff to lower order (only if needed)
+                if (
+                    prob < 0.5 and len(context) > 1
+                ):  # Only backoff if high-order prob is low
                     shorter_context = context[1:]
-                    if shorter_context in model.word_chain:
-                        count = model.word_chain[shorter_context].get(next_word, 0)
-                        total = sum(model.word_chain[shorter_context].values())
-                        probs.append(
-                            (0.2, (count + 1) / (total + len(model.vocabulary)))
-                        )
-                        total_lambda += 0.2
+                    if shorter_context in model.word_chain_probs:
+                        context_probs = model.word_chain_probs[shorter_context]
+                        if next_word in context_probs:
+                            prob += lambda2 * context_probs[next_word]
 
-                # Unigram probability
-                unigram_count = sum(1 for w in model.word_counts if w == next_word)
-                total_words_count = sum(model.word_counts.values())
-                probs.append(
-                    (
-                        0.1,
-                        (unigram_count + 1)
-                        / (total_words_count + len(model.vocabulary)),
+                # Unigram probability (only if needed)
+                if prob < 0.1:  # Only use unigram if higher-order probs are very low
+                    unigram_prob = (
+                        model.word_counts.get(next_word, 0) / total_word_count
                     )
-                )
-                total_lambda += 0.1
+                    prob += lambda3 * (unigram_prob + 1 / vocab_size)
 
-                # Combine probabilities
-                prob = sum(weight * p for weight, p in probs) / total_lambda
+                # Ensure prob is not zero (smoothing)
+                prob = max(prob, 1e-10)
+
                 total_log_likelihood += np.log(prob)
                 total_words += 1
 
@@ -159,19 +172,23 @@ def prepare_data(texts: List[str], vocab_size: int = 10000):
     return {"texts": texts, "word2idx": word2idx, "vocab_size": len(vocab)}
 
 
-def train_self_attention(model, train_loader, val_loader, num_epochs=10, patience=3):
-    """
-    Train the self-attention model with early stopping
-    """
+def train_self_attention(model, train_loader, val_loader, num_epochs=100, patience=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     criterion = torch.nn.CrossEntropyLoss(ignore_index=0)  # 0 is pad_idx
     optimizer = torch.optim.Adam(model.parameters())
 
+    # Add ReduceLROnPlateau scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.1, patience=3
+    )
+
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    for epoch in tqdm(range(num_epochs)):
+    pbar = tqdm(range(num_epochs), desc="Training")
+
+    for epoch in pbar:
         # Training
         model.train()
         total_loss = 0
@@ -198,6 +215,9 @@ def train_self_attention(model, train_loader, val_loader, num_epochs=10, patienc
                     output.view(-1, output.size(-1)), target_seq.view(-1)
                 ).item()
 
+        # Step the scheduler based on validation loss
+        scheduler.step(val_loss)
+
         # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -207,6 +227,10 @@ def train_self_attention(model, train_loader, val_loader, num_epochs=10, patienc
             if epochs_without_improvement >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+
+        # Update progress bar with learning rate
+        current_lr = optimizer.param_groups[0]["lr"]
+        pbar.set_description(f"Training (lr={current_lr:.2e})")
 
     return model
 
@@ -281,12 +305,76 @@ def compare_models(
             "Perplexity": perplexity,
         }
 
+    results["Models"] = models
     return results
 
 
-def print_results(results: Dict[str, Dict[str, float]]):
+def compare_models_with_stats(
+    train_texts: List[str],
+    test_texts: List[str],
+    word2idx=None,
+    idx2word=None,
+    train_loader=None,
+    val_loader=None,
+    test_loader=None,
+    num_runs: int = 20,
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    models = {
+        "Genetic Algorithm": GAModel(),
+        "Markov Model": MarkovModel(order=2),
+        "Self-Attention": SelfAttentionModel(
+            vocab_size=len(word2idx), embed_size=128, num_heads=8, num_layers=4
+        ),
+    }
+
+    # Set vocabulary mappings for transformer model
+    models["Self-Attention"].set_vocab_mappings(word2idx, idx2word)
+
+    all_results = {
+        name: {
+            "Training Time (s)": [],
+            "Generation Time (s)": [],
+            "Memory Usage (MB)": [],
+            "Peak Memory (MB)": [],
+            "Perplexity": [],
+        }
+        for name in models.keys()
+    }
+
+    # Store individual run results
+    run_results = []
+
+    # Run multiple times
+    for run in range(num_runs):
+        print(f"\nRun {run + 1}/{num_runs}")
+
+        results = compare_models(
+            train_texts, test_texts, models, train_loader, val_loader, test_loader
+        )
+
+        run_results.append(results)
+
+        # Collect results from each run
+        for model_name, metrics in results.items():
+            if model_name != "Models":
+                for metric, value in metrics.items():
+                    all_results[model_name][metric].append(value)
+
+    # Calculate statistics
+    final_results = {}
+    for model_name, metrics in all_results.items():
+        final_results[model_name] = {
+            metric: {"mean": np.mean(values), "std": np.std(values), "values": values}
+            for metric, values in metrics.items()
+        }
+    final_results["Models"] = results["Models"]
+
+    return final_results
+
+
+def print_results_with_stats(results: Dict[str, Dict[str, Dict[str, float]]]):
     """
-    Print comparison results in a formatted table
+    Print comparison results with individual runs and statistics
     """
     metrics = [
         "Training Time (s)",
@@ -296,20 +384,39 @@ def print_results(results: Dict[str, Dict[str, float]]):
         "Perplexity",
     ]
 
-    # Print header
-    print("\nModel Comparison Results:")
-    print("-" * 100)
+    for model_name, metrics_dict in results.items():
+        if model_name != "Models":
+            print(f"\n{'-' * 80}")
+            print(f"Results for {model_name}:")
+            print(f"{'-' * 80}")
+
+            for metric in metrics:
+                values = metrics_dict[metric]["values"]
+                mean = metrics_dict[metric]["mean"]
+                std = metrics_dict[metric]["std"]
+
+                print(f"\n{metric}:")
+                print(f"Individual runs: ", end="")
+                for val in values:
+                    print(f"{val:.4f}, ", end="")
+                print(f"\nMean ± Std: {mean:.4f} ± {std:.4f}")
+
+    # Print summary table
+    print(f"\n{'-' * 140}")
+    print("Summary Table:")
+    print(f"{'-' * 140}")
     print(f"{'Model':<20}", end="")
     for metric in metrics:
-        print(f"{metric:<20}", end="")
+        print(f"{metric:<24}", end="")
     print()
-    print("-" * 100)
+    print(f"{'-' * 140}")
 
-    # Print results
     for model_name, metrics_dict in results.items():
-        print(f"{model_name:<20}", end="")
-        for metric in metrics:
-            value = metrics_dict[metric]
-            print(f"{value:<20.4f}", end="")
-        print()
-    print("-" * 100)
+        if model_name != "Models":
+            print(f"{model_name:<20}", end="")
+            for metric in metrics:
+                mean = metrics_dict[metric]["mean"]
+                std = metrics_dict[metric]["std"]
+                print(f"{mean:>.2f} ± {std:>.2f}".ljust(24), end="")
+            print()
+    print(f"{'-' * 140}")

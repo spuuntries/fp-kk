@@ -1,12 +1,12 @@
 import nltk
 from nltk.corpus import brown
-from models import (
-    ContinuationGenerator,
-    AdvancedMarkovModel,
-    SelfAttentionModel,
-    LanguageModelDataset,
+from models import LanguageModelDataset
+from evaluation import (
+    compare_models,
+    compare_models_with_stats,
+    prepare_data,
+    print_results_with_stats,
 )
-from evaluation import compare_models, print_results, prepare_data
 import torch
 from torch.utils.data import random_split, DataLoader
 import random
@@ -67,32 +67,21 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=32)
     test_loader = DataLoader(test_dataset, batch_size=32)
 
-    # Initialize models
-    print("Initializing models...")
-    models = {
-        "Continuation Generator": ContinuationGenerator(),
-        "Markov Model": AdvancedMarkovModel(order=2),
-        "Self-Attention": SelfAttentionModel(
-            vocab_size=len(word2idx), embed_size=128, num_heads=8, num_layers=3
-        ),
-    }
-
-    # Set vocabulary mappings for transformer model
-    models["Self-Attention"].set_vocab_mappings(word2idx, idx2word)
-
     # Compare models
     print("Starting model comparison...")
-    results = compare_models(
+    results = compare_models_with_stats(
         train_texts=train_texts,
         test_texts=test_texts,
-        models=models,
+        word2idx=word2idx,
+        idx2word=idx2word,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
+        num_runs=20,
     )
 
     # Print results
-    print_results(results)
+    print_results_with_stats(results)
 
     # Generate example outputs
     print("\nExample Generations:")
@@ -108,7 +97,7 @@ def main():
 
     for prompt in test_prompts:
         print(f"\nPrompt: {prompt}")
-        for name, model in models.items():
+        for name, model in results["Models"].items():
             try:
                 if isinstance(model, torch.nn.Module):
                     output = model.generate(prompt, max_length=20)

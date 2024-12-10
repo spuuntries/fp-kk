@@ -18,7 +18,7 @@ from tqdm import tqdm
 import math
 
 
-class ContinuationGenerator:
+class GAModel:
     def __init__(self):
         if "FitnessMax" not in creator.__dict__:
             creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -52,7 +52,6 @@ class ContinuationGenerator:
         self.toolbox.register("select", tools.selTournament, tournsize=5)
 
     def get_ngram_count(self, ngram_dict, *keys):
-        """Safely get n-gram count without creating new entries"""
         current = ngram_dict
         for key in keys:
             if key not in current:
@@ -335,7 +334,7 @@ class ContinuationGenerator:
 
         input_words = input_sentence.lower().split()
         current_length = len(input_words)
-        words_to_generate = max(1, target_length - current_length)
+        words_to_generate = max(2, target_length - current_length)
 
         # Create fresh toolbox for each generation
         toolbox = base.Toolbox()
@@ -393,11 +392,26 @@ class ContinuationGenerator:
 
             return (score,)
 
+        if words_to_generate <= 1:
+            # If we need very few words, just use simple generation instead of GA
+            context = input_words[-3:] if len(input_words) > 3 else input_words
+            pattern = self.find_similar_pattern(" ".join(context))
+            result = input_sentence + " " + self.get_likely_word(pattern[0], context)
+            return self.clean_text(result)
+
+        # Modify mate operation to handle small sequences
+        def safe_mate(ind1, ind2):
+            if len(ind1) < 2 or len(ind2) < 2:
+                return ind1, ind2
+            return tools.cxTwoPoint(ind1, ind2)
+
+        # Register the safe mate function instead
+        toolbox.register("mate", safe_mate)
+
         # Register all functions to fresh toolbox
         toolbox.register("individual", create_individual)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
         toolbox.register("evaluate", evaluate)
-        toolbox.register("mate", tools.cxTwoPoint)
         toolbox.register("mutate", self.mutate_word)
         toolbox.register("select", tools.selTournament, tournsize=3)
 
@@ -417,8 +431,7 @@ class ContinuationGenerator:
         return result
 
 
-# Markov Model
-class AdvancedMarkovModel:
+class MarkovModel:
     def __init__(self, order=4):
         self.order = order
         self.word_chain = defaultdict(lambda: defaultdict(int))
@@ -429,30 +442,54 @@ class AdvancedMarkovModel:
         self.start_token = "<START>"
         self.end_token = "<END>"
 
+    def reset(self):
+        self.word_chain = defaultdict(lambda: defaultdict(int))
+        self.char_chain = defaultdict(lambda: defaultdict(int))
+        self.vocabulary = set()
+        self.word_counts = defaultdict(int)
+        self.word_chain_probs = defaultdict(dict)
+        self.char_chain_probs = defaultdict(dict)
+
     def preprocess_text(self, text: str) -> List[str]:
         text = " ".join(text.lower().split())
         words = [word.strip() for word in re.findall(r"\b\w+\b", text)]
         return words if words else []
 
+    def predict_next(self, seed_sequence: List[str], temperature=1.0):
+        """Predict next word using backoff strategy"""
+        # Start with full order (4-gram) and back off to smaller n-grams
+        for n in range(self.order, 0, -1):
+            # Get the context of size n
+            context = tuple(seed_sequence[-n:])
+
+            if context in self.word_chain_probs:
+                probs = self.word_chain_probs[context]
+                if temperature != 1.0:
+                    probs = self._apply_temperature(probs, temperature)
+                return random.choices(list(probs.keys()), list(probs.values()))[0]
+
+        # If no n-gram matches found, fallback to random
+        return random.choice(list(self.vocabulary))
+
     def fit(self, texts: List[str]):
+        """Modified fit to store all n-gram orders"""
         for text in tqdm(texts):
             words = self.preprocess_text(text)
             if not words:
                 continue
 
+            # Add words to vocabulary
             for word in words:
                 self.vocabulary.add(word)
                 self.word_counts[word] += 1
 
-                chars = list(word)
-                for i in range(len(chars) - 1):
-                    self.char_chain[chars[i]][chars[i + 1]] += 1
-
+            # Store n-grams of all orders up to self.order
             padded_words = [self.start_token] * self.order + words + [self.end_token]
-            for i in range(len(padded_words) - self.order):
-                context = tuple(padded_words[i : i + self.order])
-                next_word = padded_words[i + self.order]
-                self.word_chain[context][next_word] += 1
+            for n in range(1, self.order + 1):
+                for i in range(len(padded_words) - n):
+                    context = tuple(padded_words[i : i + n])
+                    next_word = padded_words[i + n]
+                    self.word_chain[context][next_word] += 1
 
         self._normalize_probabilities()
         return self
@@ -474,25 +511,6 @@ class AdvancedMarkovModel:
                 self.char_chain_probs[char][next_char] = (
                     self.char_chain[char][next_char] / total
                 )
-
-    def predict_next(self, seed_sequence: List[str], temperature=1.0):
-        """Predict the next word given a seed sequence."""
-        # Preprocess the seed sequence
-        seed_sequence = [word.lower().strip() for word in seed_sequence]
-
-        # Take the last 'order' words as context
-        context = tuple(seed_sequence[-self.order :])
-
-        if context in self.word_chain_probs:
-            probs = self.word_chain_probs[context]
-            if temperature != 1.0:
-                probs = self._apply_temperature(probs, temperature)
-
-            next_word = random.choices(list(probs.keys()), list(probs.values()))[0]
-        else:
-            next_word = random.choice(list(self.vocabulary))
-
-        return next_word
 
     def generate_text(self, num_words=50, temperature=1.0, seed_sequence=None):
         """
