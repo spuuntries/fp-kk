@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import math
 import tracemalloc
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from typing import List, Dict, Any
 from collections import Counter
@@ -170,7 +171,7 @@ def train_self_attention(model, train_loader, val_loader, num_epochs=10, patienc
     best_val_loss = float("inf")
     epochs_without_improvement = 0
 
-    for epoch in range(num_epochs):
+    for epoch in tqdm(range(num_epochs)):
         # Training
         model.train()
         total_loss = 0
@@ -268,7 +269,7 @@ def compare_models(
             elif hasattr(model, "generate"):
                 model.generate("The cat sat on")
             else:
-                model.generate_text(num_words=20)
+                model.generate_text(num_words=20, seed_sequence="The cat sat on")
 
         generation_time = (time.time() - start_time) / 5
 

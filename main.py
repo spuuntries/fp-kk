@@ -115,7 +115,7 @@ def main():
                 elif hasattr(model, "generate"):
                     output = model.generate(prompt, target_length=20)
                 else:
-                    output = model.generate_text(num_words=20)
+                    output = model.generate_text(num_words=20, seed_sequence=prompt)
                 print(f"{name}: {output}")
             except Exception as e:
                 print(f"{name}: Error generating - {str(e)}")

@@ -43,13 +43,13 @@ class ContinuationGenerator:
         self.suffix_punct = {'"', ")", "]", "}"}
         self.contractions = {"s", "t", "ll", "re", "ve", "m", "d"}
 
-        self.max_length = 15  # Reduced max length for more coherent outputs
+        self.max_length = 15
         self.min_word_freq = 3
         self.vocab_size = 50000
         self.trained = False
 
         self.toolbox = base.Toolbox()
-        self.toolbox.register("select", tools.selTournament, tournsize=3)
+        self.toolbox.register("select", tools.selTournament, tournsize=5)
 
     def get_ngram_count(self, ngram_dict, *keys):
         """Safely get n-gram count without creating new entries"""
@@ -61,19 +61,13 @@ class ContinuationGenerator:
         return current if isinstance(current, int) else 0
 
     def fit(self, texts: List[str]):
-        """
-        Standardized fit method that takes a list of texts like the other models
-
-        Args:
-            texts: List of strings, each string being a sentence/text
-        """
         print("Training on provided texts...")
 
         # Convert texts to tokenized sentences if they aren't already
         sentences = []
         for text in texts:
             if isinstance(text, str):
-                words = text.split()  # or use nltk.word_tokenize(text)
+                words = nltk.word_tokenize(text)
                 if words:
                     sentences.append(words)
 
@@ -92,6 +86,8 @@ class ContinuationGenerator:
             )[: self.vocab_size]
             if freq >= self.min_word_freq
         }
+
+        print(f"Vocab size: {len(self.valid_words)}")
 
         del word_freqs
 
@@ -200,9 +196,7 @@ class ContinuationGenerator:
 
         return result.strip()
 
-    def get_likely_word(
-        self, pos: str, context: List[str], tau: float = 3.0
-    ):  # Even lower tau
+    def get_likely_word(self, pos: str, context: List[str], tau: float = 1.0):
         candidates = self.vocab_by_pos.get(pos, [])
         if not candidates:
             return random.choice(
@@ -254,7 +248,7 @@ class ContinuationGenerator:
             result = 0
             num = 0
             den = 0
-            for i in range(min(len(probs) - 1, 99)):  # Adapt to available vocab
+            for i in range(min(len(probs) - 1, 99)):
                 b = probs[i] / probs[i + 1]
                 t = (i + 2) / (i + 1)
                 num += math.log(b) * math.log(t)
@@ -425,7 +419,7 @@ class ContinuationGenerator:
 
 # Markov Model
 class AdvancedMarkovModel:
-    def __init__(self, order=2):
+    def __init__(self, order=4):
         self.order = order
         self.word_chain = defaultdict(lambda: defaultdict(int))
         self.char_chain = defaultdict(lambda: defaultdict(int))
@@ -434,15 +428,14 @@ class AdvancedMarkovModel:
         self.unknown_token = "<UNK>"
         self.start_token = "<START>"
         self.end_token = "<END>"
-        self.stemmer = PorterStemmer()
 
     def preprocess_text(self, text: str) -> List[str]:
-        text = text.lower()
+        text = " ".join(text.lower().split())
         words = [word.strip() for word in re.findall(r"\b\w+\b", text)]
         return words if words else []
 
     def fit(self, texts: List[str]):
-        for text in texts:
+        for text in tqdm(texts):
             words = self.preprocess_text(text)
             if not words:
                 continue
@@ -482,24 +475,62 @@ class AdvancedMarkovModel:
                     self.char_chain[char][next_char] / total
                 )
 
-    def generate_text(self, num_words=50, temperature=1.0):
-        current_words = [self.start_token] * self.order
-        generated_words = []
+    def predict_next(self, seed_sequence: List[str], temperature=1.0):
+        """Predict the next word given a seed sequence."""
+        # Preprocess the seed sequence
+        seed_sequence = [word.lower().strip() for word in seed_sequence]
+
+        # Take the last 'order' words as context
+        context = tuple(seed_sequence[-self.order :])
+
+        if context in self.word_chain_probs:
+            probs = self.word_chain_probs[context]
+            if temperature != 1.0:
+                probs = self._apply_temperature(probs, temperature)
+
+            next_word = random.choices(list(probs.keys()), list(probs.values()))[0]
+        else:
+            next_word = random.choice(list(self.vocabulary))
+
+        return next_word
+
+    def generate_text(self, num_words=50, temperature=1.0, seed_sequence=None):
+        """
+        Generate text with optional seed sequence.
+
+        Args:
+            num_words: Number of words to generate
+            temperature: Sampling temperature
+            seed_sequence: Optional list or string of seed text
+        """
+        # Handle string input for seed sequence
+        if isinstance(seed_sequence, str):
+            seed_sequence = self.preprocess_text(seed_sequence)
+        elif seed_sequence is None:
+            seed_sequence = []
+
+        # Process seed sequence
+        if seed_sequence:
+            # If seed sequence is shorter than order, pad with start tokens
+            if len(seed_sequence) < self.order:
+                current_words = [self.start_token] * (
+                    self.order - len(seed_sequence)
+                ) + seed_sequence
+            else:
+                # Take the last 'order' words
+                current_words = seed_sequence[-self.order :]
+
+            # Initialize generated_words with the seed sequence
+            generated_words = seed_sequence[:]
+        else:
+            current_words = [self.start_token] * self.order
+            generated_words = []
 
         for _ in range(num_words):
-            context = tuple(current_words[-self.order :])
-
-            if context in self.word_chain_probs:
-                probs = self.word_chain_probs[context]
-                if temperature != 1.0:
-                    probs = self._apply_temperature(probs, temperature)
-
-                next_word = random.choices(list(probs.keys()), list(probs.values()))[0]
-            else:
-                next_word = random.choice(list(self.vocabulary))
+            next_word = self.predict_next(current_words, temperature)
 
             if next_word == self.end_token:
-                if len(generated_words) < num_words // 2:
+                if len(generated_words) < (num_words + len(seed_sequence)) // 2:
                     current_words = [self.start_token] * self.order
                     continue
                 else:
@@ -507,6 +538,7 @@ class AdvancedMarkovModel:
 
             generated_words.append(next_word)
             current_words.append(next_word)
+            current_words = current_words[1:]
 
         return " ".join(generated_words)
 
